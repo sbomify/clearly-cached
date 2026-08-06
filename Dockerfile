@@ -4,7 +4,7 @@
 #
 # TLS roots are compiled in via reqwest's webpki-roots feature rather than read
 # from /etc/ssl, which is what makes scratch viable.
-FROM rust:1.90-alpine AS builder
+FROM rust:1.97-alpine AS builder
 
 # musl-dev/gcc for the linker and the C dependencies of the TLS stack.
 RUN apk add --no-cache musl-dev gcc
