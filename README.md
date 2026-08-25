@@ -142,8 +142,27 @@ power cut costs a re-fetch, which is what a cache is for.
 | `UPSTREAM_DEADLINE_SECS` | `25` | Ceiling across all attempts |
 | `CLIENT_DEADLINE_SECS` | `5` | How long a *request* waits. The resolve behind it keeps running and still populates the cache, so a caller that gives up loses latency rather than the answer |
 
+`CLIENT_DEADLINE_SECS` only does anything below `UPSTREAM_DEADLINE_SECS`. Set at
+or above it, the resolve always answers first and every caller waits out the
+upstream deadline to be told to retry — the bound is still there, it just never
+fires. The service says so at startup rather than refusing to run.
+
 If `CACHE_PATH` cannot be opened the service logs it and runs memory-only rather
 than refusing to start — a missing volume should not be an outage.
+
+## Which build is running
+
+`/stats` reports the version alongside the counters, and the same version is on
+the startup line.
+
+```console
+$ curl -s https://…/stats | jq .version
+"0.3.0"
+```
+
+Worth checking before reading behaviour as a bug: the counters, the `x-cache`
+header and the error bodies are identical across releases, so a deployment a
+release behind is indistinguishable from a live one by anything else it serves.
 
 ## Running
 

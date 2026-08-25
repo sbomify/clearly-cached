@@ -1,6 +1,6 @@
 [package]
 name = "clearly-cached"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 # What the image builds with and what CI lints and tests with. Nothing checks
 # an older floor, so claiming one would be a guess.
