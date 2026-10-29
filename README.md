@@ -177,8 +177,16 @@ the startup line.
 
 ```console
 $ curl -s https://…/stats | jq .version
-"0.4.0"
+"26.10.0"
 ```
+
+Versions are CalVer, `YY.M.PATCH`, matching the other sbomify projects: the
+two-digit year and month of the release, then a counter that restarts at 0
+each month. The month is not zero-padded, because the version is also the
+crate version and Cargo requires valid SemVer, which forbids leading zeros.
+Images are tagged with the full version and with `YY.M`, the latest release of
+that month. Releases before the switch were `0.1.0` to `0.3.0`, and they sort
+below every CalVer version.
 
 Worth checking before reading behaviour as a bug: the counters, the `x-cache`
 header and the error bodies are identical across releases, so a deployment a
