@@ -82,6 +82,22 @@ split, and counts down with the entry rather than re-arming on each hit — a fu
 `max-age` on a nearly-expired entry would let the edge hold it for twice its
 intended life.
 
+**Serves an expired answer while it refetches.** Expiry means an answer is due
+for a re-check, not that it is wrong. An expired entry is kept for
+`CACHE_STALE_SECS` longer and, when asked for, served at once with
+`x-cache: STALE` and `max-age=0` while one refetch runs behind it. This matters
+most for unharvested coordinates: they have the short TTL *and* they are the
+ones upstream is slowest to produce, so forgetting them on expiry sent every
+coordinate the service had already answered back to stalling its callers. A
+failed refetch leaves the stale answer in place.
+
+**Does not re-ask about a coordinate that just failed.** A resolve fails only
+after its retries and the upstream deadline. For `UPSTREAM_COOLDOWN_SECS`
+afterwards, a request for that coordinate gets `503` with `Retry-After`
+straight away rather than another wait for the same outcome, and upstream gets
+no further fetch for it. Memory only, never cached, and never an answer about
+the coordinate itself.
+
 **Reports upstream rejections as rejections.** A coordinate upstream refuses
 comes back as `404`, not `504`. Nothing here is cached, so answering a permanent
 error with a retry-me status would put a retrying client in a loop against an
@@ -98,11 +114,12 @@ Memory holds what is hot. Disk holds everything.
 Eviction is a memory concern: when the map is full the oldest entries go, but
 they are still on disk, and reading one back is a local seek rather than a round
 trip to an upstream that stalls on 40% of cold requests. Disk keeps what it is
-given — entries leave when they expire, swept hourly and once at startup.
+given — entries leave once they are past expiry plus the stale grace period,
+swept hourly and once at startup.
 
 | | memory | disk |
 | --- | --- | --- |
-| holds | `CACHE_CAPACITY` entries | everything unexpired |
+| holds | `CACHE_CAPACITY` entries | everything inside its stale grace |
 | evicts | yes, when full | only over `CACHE_DISK_MAX_ENTRIES` |
 | survives a restart | no | yes |
 | typical read | ~1 µs | ~100 µs |
@@ -114,7 +131,8 @@ drops the soonest-to-expire entries, which were going to be re-fetched first
 anyway. Set it to `0` for genuinely unbounded.
 
 The `x-cache` header says which answered: `HIT` from memory, `HIT-DISK` from
-disk, `MISS` when it went upstream. `/stats` reports the same split, and
+disk, `MISS` when it went upstream, `STALE` for an expired answer served while
+it is refetched. `/stats` reports the same split, and
 `disk_hits` is the number that says whether the disk tier is earning its keep.
 
 Concurrent requests for one cold coordinate collapse onto a single resolve, so
@@ -137,6 +155,8 @@ power cut costs a re-fetch, which is what a cache is for.
 | `CACHE_PATH` | `/var/cache/clearly-cached/definitions.redb` | Disk tier; set empty for memory only |
 | `CACHE_CAPACITY` | `200000` | Entries held in memory before eviction |
 | `CACHE_DISK_MAX_ENTRIES` | `2000000` | Disk ceiling; `0` for unbounded |
+| `CACHE_STALE_SECS` | `2592000` | How long past expiry an entry is still served as stale while refetched; `0` to forget on expiry |
+| `UPSTREAM_COOLDOWN_SECS` | `60` | After a coordinate's resolve fails, how long it is answered `503` without asking upstream; `0` to disable |
 | `UPSTREAM_ATTEMPTS` | `3` | Total attempts per fetch |
 | `UPSTREAM_TIMEOUT_SECS` | `8` | Per-attempt timeout |
 | `UPSTREAM_DEADLINE_SECS` | `25` | Ceiling across all attempts |
@@ -157,7 +177,7 @@ the startup line.
 
 ```console
 $ curl -s https://…/stats | jq .version
-"0.3.0"
+"0.4.0"
 ```
 
 Worth checking before reading behaviour as a bug: the counters, the `x-cache`
