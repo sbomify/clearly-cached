@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -37,10 +37,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 
 use cache::Cache;
 use clearlydefined::{Client, Coordinate, Definition, FetchError};
-use persist::Store;
+use persist::{Found, Store};
 
 /// Harvested definitions change only when someone curates them, and the
 /// coordinate itself is immutable. Long, but not forever.
@@ -48,6 +49,30 @@ const TTL_HARVESTED: Duration = Duration::from_secs(30 * 24 * 3600);
 /// An unharvested coordinate is "not looked at yet", not "no licence". It will
 /// change, so it must expire soon enough to pick that up.
 const TTL_UNHARVESTED: Duration = Duration::from_secs(6 * 3600);
+
+/// How long past expiry an entry is still served -- as stale, while it is
+/// refetched -- rather than forgotten.
+///
+/// Expiry says an answer is due for a re-check, not that it is wrong. Upstream
+/// is slowest on exactly the coordinates it has not harvested, which are the
+/// ones with the six-hour TTL, so forgetting them on expiry meant a coordinate
+/// this process had already answered went back to stalling every caller. A
+/// stale `harvested: false` costs a client nothing it would not have lost to a
+/// 504, and a stale harvested definition is at worst a curation behind.
+const DEFAULT_STALE_GRACE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// How long a coordinate whose resolve just failed is answered with an
+/// immediate 503 rather than another attempt.
+///
+/// A resolve only fails after its retries and the upstream deadline, so the
+/// coordinate is one upstream is struggling with right now. Without this every
+/// caller asking again inside that window waited out the client deadline to be
+/// told the same thing, and added another fetch to the pile upstream is
+/// already not answering.
+const DEFAULT_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Above this many remembered failures, expired ones are pruned on insert.
+const FAILURES_PRUNE_AT: usize = 10_000;
 
 /// How often expired entries are deleted from disk. Nothing else removes them,
 /// and nothing depends on it being prompt -- an expired entry is already
@@ -70,6 +95,12 @@ struct Stats {
     /// deadline. The resolve itself keeps running, so these are the ones a
     /// retry is expected to hit warm.
     slow_resolves: AtomicU64,
+    /// Answered with an expired entry while it was refetched, rather than
+    /// with a wait or a 504.
+    stale_hits: AtomicU64,
+    /// Answered 503 at once because the coordinate's last resolve had just
+    /// failed.
+    cooldown_rejections: AtomicU64,
 }
 
 /// Where an answer came from. Reported as `x-cache` so a CDN or an operator can
@@ -79,6 +110,8 @@ enum Source {
     Memory,
     Disk,
     Upstream,
+    /// Expired, served while a refetch runs.
+    Stale,
 }
 
 impl Source {
@@ -87,6 +120,7 @@ impl Source {
             Self::Memory => "HIT",
             Self::Disk => "HIT-DISK",
             Self::Upstream => "MISS",
+            Self::Stale => "STALE",
         }
     }
 }
@@ -139,6 +173,11 @@ struct AppState {
     /// optimisation, and refusing to start without it would turn a missing
     /// volume into an outage.
     store: Option<Store<Definition>>,
+    /// When each recently failed coordinate failed. See
+    /// `DEFAULT_FAILURE_COOLDOWN`; memory only, and never an answer about the
+    /// coordinate -- only about whether to ask upstream again yet.
+    failures: std::sync::Mutex<HashMap<String, Instant>>,
+    failure_cooldown: Duration,
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -174,6 +213,12 @@ async fn main() {
     // twenty more seconds for the same outcome buys nothing. Five seconds is
     // well past the warm case and well short of the deadline.
     let client_deadline = Duration::from_secs(env_u64("CLIENT_DEADLINE_SECS", 5));
+    let stale_grace =
+        Duration::from_secs(env_u64("CACHE_STALE_SECS", DEFAULT_STALE_GRACE.as_secs()));
+    let failure_cooldown = Duration::from_secs(env_u64(
+        "UPSTREAM_COOLDOWN_SECS",
+        DEFAULT_FAILURE_COOLDOWN.as_secs(),
+    ));
 
     // A client deadline at or above the upstream one is the same as having
     // none: the resolve always answers first, so every caller waits out the
@@ -209,7 +254,11 @@ async fn main() {
     // instead of an upstream fetch.
     let store = match cache_path() {
         None => None,
-        Some(path) => match Store::open(&path, env_u64("CACHE_DISK_MAX_ENTRIES", 2_000_000)) {
+        Some(path) => match Store::open(
+            &path,
+            env_u64("CACHE_DISK_MAX_ENTRIES", 2_000_000),
+            stale_grace,
+        ) {
             Ok(store) => {
                 eprintln!(
                     "cache: {} entries on disk at {}",
@@ -231,12 +280,14 @@ async fn main() {
     };
 
     let state = Arc::new(AppState {
-        cache: Cache::new(capacity),
+        cache: Cache::new(capacity, stale_grace),
         client: Client::new(http, upstream.clone(), attempts, deadline),
         client_deadline,
         stats: Stats::default(),
         inflight: std::sync::Mutex::new(HashMap::new()),
         store,
+        failures: std::sync::Mutex::new(HashMap::new()),
+        failure_cooldown,
     });
 
     let app = router(state.clone());
@@ -345,6 +396,8 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "misses": state.stats.misses.load(Ordering::Relaxed),
         "upstream_errors": state.stats.upstream_errors.load(Ordering::Relaxed),
         "slow_resolves": state.stats.slow_resolves.load(Ordering::Relaxed),
+        "stale_hits": state.stats.stale_hits.load(Ordering::Relaxed),
+        "cooldown_rejections": state.stats.cooldown_rejections.load(Ordering::Relaxed),
     }))
 }
 
@@ -384,10 +437,35 @@ async fn definition(
             return serve(def, remaining, Source::Memory);
         }
 
+        let cooling = cooldown_left(&state, &key);
+
+        // Something already answered and merely expired: say it now and
+        // refetch behind it, rather than make the caller wait on the upstream
+        // that is slowest on precisely these coordinates. One refetch at a
+        // time, and none while the last one's failure is cooling down.
+        if let Some(def) = state.cache.get_stale(&key) {
+            if cooling.is_none() && !inflight.contains_key(&key) {
+                let (tx, _) = broadcast::channel(2);
+                inflight.insert(key.clone(), tx);
+                spawn_resolve(state.clone(), coord.clone(), key.clone());
+            }
+            state.stats.stale_hits.fetch_add(1, Ordering::Relaxed);
+            return serve(def, Duration::ZERO, Source::Stale);
+        }
+
         match inflight.get(&key) {
             Some(tx) => tx.subscribe(),
             None => {
-                let (tx, rx) = broadcast::channel(1);
+                if let Some(left) = cooling {
+                    state
+                        .stats
+                        .cooldown_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    return cooling_down(left);
+                }
+                // Two slots: a resolve may announce a stale disk entry before
+                // its final answer, and a waiter must be able to see either.
+                let (tx, rx) = broadcast::channel(2);
                 inflight.insert(key.clone(), tx);
                 spawn_resolve(state.clone(), coord.clone(), key.clone());
                 rx
@@ -405,9 +483,23 @@ async fn definition(
     // The in-flight entry is deliberately left in place: a retry arriving
     // before the resolve finishes subscribes to the same one rather than
     // starting a second fetch for a coordinate upstream is already slow at.
-    let waited = tokio::time::timeout(state.client_deadline, receiver.recv()).await;
+    let next = async {
+        loop {
+            // Lagging means a newer message replaced the one missed, and the
+            // newer one is the better answer. Only a closed channel is an end.
+            match receiver.recv().await {
+                Err(RecvError::Lagged(_)) => continue,
+                other => break other,
+            }
+        }
+    };
+    let waited = tokio::time::timeout(state.client_deadline, next).await;
     let Ok(received) = waited else {
         state.stats.slow_resolves.fetch_add(1, Ordering::Relaxed);
+        if let Some(def) = state.cache.get_stale(&key) {
+            state.stats.stale_hits.fetch_add(1, Ordering::Relaxed);
+            return serve(def, Duration::ZERO, Source::Stale);
+        }
         return error(
             StatusCode::GATEWAY_TIMEOUT,
             "still resolving upstream; the fetch continues and a retry should be served from cache",
@@ -416,7 +508,12 @@ async fn definition(
 
     match received {
         Ok(shared) => match &*shared {
-            Ok((def, ttl, source)) => serve(def.clone(), *ttl, *source),
+            Ok((def, ttl, source)) => {
+                if let Source::Stale = source {
+                    state.stats.stale_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                serve(def.clone(), *ttl, *source)
+            }
             Err(failure) => error(failure.status, &failure.message),
         },
         // Every sender was dropped without publishing, which means the resolve
@@ -464,18 +561,31 @@ fn spawn_resolve(state: Arc<AppState>, coord: Coordinate, key: String) {
             key: key.clone(),
         };
 
-        if let Some((def, ttl)) = read_from_disk(&state, &key).await {
-            state.stats.disk_hits.fetch_add(1, Ordering::Relaxed);
-            // Promote, with the TTL it has left rather than a fresh one: the
-            // disk copy expires when it was always going to.
-            state.cache.insert(key.clone(), def.clone(), ttl);
-            publish(&guard, Ok((def, ttl, Source::Disk)));
-            return;
+        match read_from_disk(&state, &key).await {
+            Some(Found::Fresh(def, ttl)) => {
+                state.stats.disk_hits.fetch_add(1, Ordering::Relaxed);
+                // Promote, with the TTL it has left rather than a fresh one:
+                // the disk copy expires when it was always going to.
+                state.cache.insert(key.clone(), def.clone(), ttl);
+                publish(&guard, Ok((def, ttl, Source::Disk)));
+                return;
+            }
+            Some(Found::Stale(def, grace_left)) => {
+                // Answer whoever is waiting now and keep going: the refetch
+                // below replaces it, and in the meantime later callers find
+                // it in memory as stale rather than joining the wait.
+                state
+                    .cache
+                    .insert_stale(key.clone(), def.clone(), grace_left);
+                announce(&state, &key, Ok((def, Duration::ZERO, Source::Stale)));
+            }
+            None => {}
         }
 
         state.stats.misses.fetch_add(1, Ordering::Relaxed);
         let outcome: Shared = match state.client.fetch(&coord).await {
             Ok(def) => {
+                forget_failure(&state, &key);
                 let ttl = if def.harvested {
                     TTL_HARVESTED
                 } else {
@@ -506,8 +616,10 @@ fn spawn_resolve(state: Arc<AppState>, coord: Coordinate, key: String) {
             Err(e) => {
                 // Transient, and already retried. Never cached -- persisting a
                 // stall as "no data" is the failure this service exists to
-                // prevent. 504 is honest here: asking again may well work.
+                // prevent. 504 is honest here: asking again may well work --
+                // just not straight away, which is what the cooldown is for.
                 state.stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                remember_failure(&state, &key);
                 Err(Failure {
                     status: StatusCode::GATEWAY_TIMEOUT,
                     message: e.to_string(),
@@ -530,15 +642,59 @@ fn publish(guard: &InflightGuard, outcome: Shared) {
     }
 }
 
+/// Tell everyone waiting on a resolve something now, without ending it.
+///
+/// Unlike `publish` the sender stays in the map, so the final answer still
+/// goes out and later callers still join this resolve rather than start one.
+fn announce(state: &AppState, key: &str, outcome: Shared) {
+    if let Ok(inflight) = state.inflight.lock() {
+        if let Some(tx) = inflight.get(key) {
+            let _ = tx.send(Arc::new(outcome));
+        }
+    }
+}
+
+/// How much of a recent failure's cooldown is left, if any.
+fn cooldown_left(state: &AppState, key: &str) -> Option<Duration> {
+    let failures = state.failures.lock().ok()?;
+    let failed_at = failures.get(key)?;
+    state
+        .failure_cooldown
+        .checked_sub(failed_at.elapsed())
+        .filter(|d| !d.is_zero())
+}
+
+fn remember_failure(state: &AppState, key: &str) {
+    if state.failure_cooldown.is_zero() {
+        return;
+    }
+    let Ok(mut failures) = state.failures.lock() else {
+        return;
+    };
+    // Bounded the same way as everything else a caller can make grow: a
+    // stream of distinct failing coordinates must not accumulate forever.
+    if failures.len() >= FAILURES_PRUNE_AT {
+        let cooldown = state.failure_cooldown;
+        failures.retain(|_, at| at.elapsed() < cooldown);
+    }
+    failures.insert(key.to_owned(), Instant::now());
+}
+
+fn forget_failure(state: &AppState, key: &str) {
+    if let Ok(mut failures) = state.failures.lock() {
+        failures.remove(key);
+    }
+}
+
 /// Look the coordinate up in the disk tier.
 ///
 /// On a blocking thread: a warm read is a page-cache hit, but a cold one is a
 /// disk seek, and the runtime's worker threads are also serving requests.
-async fn read_from_disk(state: &Arc<AppState>, key: &str) -> Option<(Definition, Duration)> {
+async fn read_from_disk(state: &Arc<AppState>, key: &str) -> Option<Found<Definition>> {
     state.store.as_ref()?;
     let state = state.clone();
     let key = key.to_owned();
-    tokio::task::spawn_blocking(move || state.store.as_ref()?.get(&key))
+    tokio::task::spawn_blocking(move || state.store.as_ref()?.lookup(&key))
         .await
         .ok()
         .flatten()
@@ -569,6 +725,23 @@ fn serve(def: Definition, remaining: Duration, source: Source) -> Response {
         Json(def),
     )
         .into_response()
+}
+
+/// 503 for a coordinate whose resolve just failed, said at once.
+///
+/// `Retry-After` says when asking again will actually reach upstream; before
+/// then it would be answered the same way.
+fn cooling_down(left: Duration) -> Response {
+    let mut response = error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "upstream failed for this coordinate moments ago; not asking it again yet",
+    );
+    // Rounded up, so a client that waits exactly this long is not early.
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    if let Ok(value) = header::HeaderValue::from_str(&secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 fn error(code: StatusCode, message: &str) -> Response {
@@ -643,13 +816,34 @@ mod tests {
         deadline: Duration,
         client_deadline: Duration,
     ) -> Arc<AppState> {
+        build_state(
+            upstream,
+            capacity,
+            disk,
+            deadline,
+            client_deadline,
+            Duration::ZERO,
+        )
+    }
+
+    fn build_state(
+        upstream: String,
+        capacity: usize,
+        disk: Option<PathBuf>,
+        deadline: Duration,
+        client_deadline: Duration,
+        failure_cooldown: Duration,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
-            cache: Cache::new(capacity),
+            cache: Cache::new(capacity, DEFAULT_STALE_GRACE),
             client: Client::new(reqwest::Client::new(), upstream, 3, deadline),
             stats: Stats::default(),
             client_deadline,
             inflight: std::sync::Mutex::new(HashMap::new()),
-            store: disk.map(|p| Store::open(&p, 0).unwrap()),
+            store: disk.map(|p| Store::open(&p, 0, DEFAULT_STALE_GRACE).unwrap()),
+            failures: std::sync::Mutex::new(HashMap::new()),
+            // Off unless a test asks: most of them retry on purpose.
+            failure_cooldown,
         })
     }
 
@@ -929,5 +1123,215 @@ mod tests {
             second < first,
             "max-age was re-armed on a hit: {first} then {second}"
         );
+    }
+    fn cache_header(r: &reqwest::Response) -> String {
+        r.headers()
+            .get("x-cache")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    /// What a coordinate looked like the last time it was fetched.
+    fn previous_answer() -> Definition {
+        Definition {
+            declared: None,
+            parties: Vec::new(),
+            homepage: None,
+            source_url: None,
+            harvested: false,
+            score: 0,
+        }
+    }
+
+    /// A coordinate this process has already answered must not go back to
+    /// stalling callers just because its TTL ran out.
+    ///
+    /// The case that prompted this: unharvested coordinates get a six-hour
+    /// TTL, and they are exactly the ones upstream is slowest to produce. A
+    /// CI run more than six hours after the last one found every one of them
+    /// cold again and was told 504 after five seconds apiece.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_entry_is_served_stale_at_once_and_refetched_behind() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(hits.clone(), Duration::from_secs(2), StatusCode::OK).await;
+        // A client deadline far beyond the upstream delay, so the only way to
+        // answer quickly is not to wait at all.
+        let state = state_with_deadlines(
+            upstream,
+            16,
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
+        let base = serve_app(state.clone()).await;
+        let key = Coordinate::parse("npm", "npmjs", "-", "lodash", "4.17.21")
+            .unwrap()
+            .cache_key();
+        state
+            .cache
+            .insert(key, previous_answer(), Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let url = format!("{base}/npm/npmjs/-/lodash/4.17.21");
+        let started = std::time::Instant::now();
+        let stale = reqwest::get(&url).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for an answer already held",
+            started.elapsed()
+        );
+        assert_eq!(stale.status(), StatusCode::OK);
+        assert_eq!(cache_header(&stale), "STALE");
+        // An edge must not hold on to what is already known to be out of date.
+        assert!(stale.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("max-age=0"));
+        let body: Definition = stale.json().await.unwrap();
+        assert_eq!(body, previous_answer());
+
+        // Asked again mid-refetch: still stale, still one upstream fetch.
+        let again = reqwest::get(&url).await.unwrap();
+        assert_eq!(cache_header(&again), "STALE");
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let fresh = reqwest::get(&url).await.unwrap();
+        assert_eq!(cache_header(&fresh), "HIT");
+        let body: Definition = fresh.json().await.unwrap();
+        assert_eq!(body.declared.as_deref(), Some("MIT"));
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "refetched more than once");
+        assert_eq!(state.stats.stale_hits.load(Ordering::Relaxed), 2);
+    }
+
+    /// The same, across a restart: memory is empty, and the expired answer is
+    /// only on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_entry_on_disk_is_served_stale_after_a_restart() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(hits.clone(), Duration::from_secs(2), StatusCode::OK).await;
+        let path = temp_db();
+        let key = Coordinate::parse("npm", "npmjs", "-", "lodash", "4.17.21")
+            .unwrap()
+            .cache_key();
+        {
+            let store = Store::open(&path, 0, DEFAULT_STALE_GRACE).unwrap();
+            store.put(&key, &previous_answer(), Duration::ZERO);
+            // Dropping flushes the queued write and releases the file.
+        }
+
+        let state = state_with_deadlines(
+            upstream,
+            16,
+            Some(path),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
+        let base = serve_app(state.clone()).await;
+        let url = format!("{base}/npm/npmjs/-/lodash/4.17.21");
+
+        let started = std::time::Instant::now();
+        let stale = reqwest::get(&url).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for an answer already on disk",
+            started.elapsed()
+        );
+        assert_eq!(cache_header(&stale), "STALE");
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let fresh = reqwest::get(&url).await.unwrap();
+        assert_eq!(cache_header(&fresh), "HIT");
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+    }
+
+    /// A coordinate whose resolve has just failed is answered at once, not
+    /// after another wait for the same failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_coordinate_that_just_failed_is_refused_at_once() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(
+            hits.clone(),
+            Duration::ZERO,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let state = build_state(
+            upstream,
+            16,
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let base = serve_app(state.clone()).await;
+        let url = format!("{base}/npm/npmjs/-/flaky/1.0.0");
+
+        let first = reqwest::get(&url).await.unwrap();
+        assert_eq!(first.status(), StatusCode::GATEWAY_TIMEOUT);
+        let fetched = hits.load(Ordering::Relaxed);
+
+        let second = reqwest::get(&url).await.unwrap();
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after: u64 = second.headers()[header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(retry_after > 0 && retry_after <= 60);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            fetched,
+            "the cooldown still asked upstream"
+        );
+        assert_eq!(state.stats.cooldown_rejections.load(Ordering::Relaxed), 1);
+
+        // Only that coordinate: a neighbour is asked about normally.
+        let other = reqwest::get(format!("{base}/npm/npmjs/-/other/1.0.0"))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// A failed refetch does not take away the stale answer it was covering.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_upstream_does_not_lose_a_stale_answer() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(
+            hits.clone(),
+            Duration::ZERO,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let state = build_state(
+            upstream,
+            16,
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let base = serve_app(state.clone()).await;
+        let key = Coordinate::parse("npm", "npmjs", "-", "lodash", "4.17.21")
+            .unwrap()
+            .cache_key();
+        state
+            .cache
+            .insert(key, previous_answer(), Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let url = format!("{base}/npm/npmjs/-/lodash/4.17.21");
+
+        assert_eq!(cache_header(&reqwest::get(&url).await.unwrap()), "STALE");
+        // Let the refetch fail.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let fetched = hits.load(Ordering::Relaxed);
+        assert!(fetched > 0, "no refetch was attempted");
+
+        let after = reqwest::get(&url).await.unwrap();
+        assert_eq!(after.status(), StatusCode::OK);
+        assert_eq!(cache_header(&after), "STALE");
+        // And the cooldown holds off another refetch behind it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(hits.load(Ordering::Relaxed), fetched);
     }
 }

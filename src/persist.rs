@@ -20,6 +20,9 @@
 //! a cache miss, so committing per entry would fsync once per upstream fetch to
 //! save work that a crash makes us redo anyway. Losing the last batch costs a
 //! re-fetch, which is the thing this is a cache for.
+//!
+//! An entry outlives its expiry by a grace period, during which it is read back
+//! as stale rather than not at all. See `Found`.
 
 use std::collections::BinaryHeap;
 use std::ops::Bound;
@@ -52,6 +55,15 @@ const EVICT_BATCH: usize = 50_000;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// What a lookup found.
+pub enum Found<V> {
+    /// Live, with the TTL it has left.
+    Fresh(V, Duration),
+    /// Expired but inside the grace period, with the grace it has left. Worth
+    /// answering with while it is refetched, and not worth anything more.
+    Stale(V, Duration),
+}
+
 /// A stored value and when it stops being one.
 #[derive(Serialize, Deserialize)]
 struct Record<V> {
@@ -76,6 +88,8 @@ pub struct Store<V> {
     /// Taken by whichever call to `shutdown` gets there first. Behind a lock
     /// because the store lives in shared state and shutdown only borrows it.
     writer: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Seconds past expiry an entry is kept and readable as stale.
+    grace: u64,
     _marker: std::marker::PhantomData<fn() -> V>,
 }
 
@@ -91,7 +105,11 @@ impl<V: Serialize + DeserializeOwned> Store<V> {
     /// it. Unlike the memory cache there is no eviction on the write path --
     /// disk is meant to keep what it is given -- so this is what stops a caller
     /// enumerating coordinates until the volume is full.
-    pub fn open(path: &Path, max_entries: u64) -> Result<Self, Error> {
+    ///
+    /// `grace` is how long past expiry an entry is kept, readable through
+    /// `lookup` as stale; the sweep removes it only after that.
+    pub fn open(path: &Path, max_entries: u64, grace: Duration) -> Result<Self, Error> {
+        let grace = grace.as_secs();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -107,32 +125,49 @@ impl<V: Serialize + DeserializeOwned> Store<V> {
         let writer_db = db.clone();
         let writer = std::thread::Builder::new()
             .name("cache-writer".into())
-            .spawn(move || run_writer(writer_db, rx, max_entries))?;
+            .spawn(move || run_writer(writer_db, rx, max_entries, grace))?;
 
         Ok(Self {
             db,
             tx,
             writer: std::sync::Mutex::new(Some(writer)),
+            grace,
             _marker: std::marker::PhantomData,
         })
     }
 
-    /// The value and the TTL it has left, or `None` if absent or expired.
+    /// The value and the TTL it has left, or `None` if absent or expired --
+    /// stale included. The service reads through `lookup`; this is the shape
+    /// the tests want.
+    #[cfg(test)]
+    pub fn get(&self, key: &str) -> Option<(V, Duration)> {
+        match self.lookup(key)? {
+            Found::Fresh(v, ttl) => Some((v, ttl)),
+            Found::Stale(..) => None,
+        }
+    }
+
+    /// The entry, fresh or inside its grace period, or `None` if absent or
+    /// past both.
     ///
     /// Blocking. Callers on an async runtime must run it on a blocking thread:
     /// a warm read is a page-cache hit but a cold one is a disk seek.
-    pub fn get(&self, key: &str) -> Option<(V, Duration)> {
+    pub fn lookup(&self, key: &str) -> Option<Found<V>> {
         let txn = self.db.begin_read().ok()?;
         let table = txn.open_table(DEFINITIONS).ok()?;
         let bytes = table.get(key).ok()??;
         let record: Record<V> = serde_json::from_slice(bytes.value()).ok()?;
         let now = unix_now();
-        if record.e <= now {
+        if record.e > now {
+            return Some(Found::Fresh(record.v, Duration::from_secs(record.e - now)));
+        }
+        let forget_at = record.e.saturating_add(self.grace);
+        if forget_at <= now {
             // Left for the sweep rather than deleted here: a read should not
             // need a write transaction, and the entry is already invisible.
             return None;
         }
-        Some((record.v, Duration::from_secs(record.e - now)))
+        Some(Found::Stale(record.v, Duration::from_secs(forget_at - now)))
     }
 
     /// Queue a write. Never blocks the caller on disk.
@@ -184,7 +219,7 @@ impl<V> Drop for Store<V> {
     }
 }
 
-fn run_writer(db: Arc<Database>, rx: Receiver<Msg>, max_entries: u64) {
+fn run_writer(db: Arc<Database>, rx: Receiver<Msg>, max_entries: u64, grace: u64) {
     let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Ends when every sender is gone, which happens when the store is dropped.
@@ -199,7 +234,7 @@ fn run_writer(db: Arc<Database>, rx: Receiver<Msg>, max_entries: u64) {
                         Ok(Msg::Put(k, b)) => pending.push((k, b)),
                         Ok(Msg::Sweep) => {
                             commit(&db, &mut pending);
-                            sweep(&db, max_entries);
+                            sweep(&db, max_entries, grace);
                         }
                         Ok(Msg::Shutdown) => {
                             commit(&db, &mut pending);
@@ -210,7 +245,7 @@ fn run_writer(db: Arc<Database>, rx: Receiver<Msg>, max_entries: u64) {
                 }
                 commit(&db, &mut pending);
             }
-            Msg::Sweep => sweep(&db, max_entries),
+            Msg::Sweep => sweep(&db, max_entries, grace),
             Msg::Shutdown => break,
         }
     }
@@ -240,15 +275,17 @@ fn commit(db: &Database, pending: &mut Vec<(String, Vec<u8>)>) {
     pending.clear();
 }
 
-/// Delete expired entries, then anything over the size cap.
+/// Delete entries past their grace period, then anything over the size cap.
 ///
 /// Both passes work in bounded batches. Collecting every expired key first and
 /// deleting them in one transaction is simpler, but on a multi-million-row
 /// table that is hundreds of megabytes of keys plus the transaction's dirty
 /// pages held in this thread -- which is the unbounded memory the disk tier
 /// exists to avoid, arriving by another route.
-fn sweep(db: &Database, max_entries: u64) {
-    let now = unix_now();
+fn sweep(db: &Database, max_entries: u64, grace: u64) {
+    // An entry is only gone once its grace period is; until then it is the
+    // stale answer a slow refetch is covered by.
+    let now = unix_now().saturating_sub(grace);
     let mut cursor: Option<String> = None;
     let mut removed = 0usize;
 
@@ -411,13 +448,13 @@ mod tests {
     /// Close one store and reopen the same file, the way a restart would.
     fn restart(store: Store<String>, path: &Path) -> Store<String> {
         drop(store); // Releases redb's file lock once the writer has joined.
-        Store::<String>::open(path, 0).unwrap()
+        Store::<String>::open(path, 0, Duration::ZERO).unwrap()
     }
 
     #[test]
     fn survives_a_restart() {
         let path = temp_path();
-        let store = Store::<String>::open(&path, 0).unwrap();
+        let store = Store::<String>::open(&path, 0, Duration::ZERO).unwrap();
         store.put(
             "npm/npmjs/-/lodash/4.17.21",
             &"MIT".into(),
@@ -435,7 +472,7 @@ mod tests {
     #[test]
     fn an_expired_entry_is_not_returned() {
         let path = temp_path();
-        let store = Store::<String>::open(&path, 0).unwrap();
+        let store = Store::<String>::open(&path, 0, Duration::ZERO).unwrap();
         store.put("stale", &"x".into(), Duration::from_secs(0));
         store.put("fresh", &"y".into(), Duration::from_secs(600));
 
@@ -447,7 +484,7 @@ mod tests {
     #[test]
     fn sweeping_removes_expired_entries_and_keeps_live_ones() {
         let path = temp_path();
-        let store = Store::<String>::open(&path, 0).unwrap();
+        let store = Store::<String>::open(&path, 0, Duration::ZERO).unwrap();
         for i in 0..10 {
             store.put(&format!("stale{i}"), &"x".into(), Duration::from_secs(0));
         }
@@ -462,7 +499,7 @@ mod tests {
     #[test]
     fn a_repeated_key_keeps_the_later_value() {
         let path = temp_path();
-        let store = Store::<String>::open(&path, 0).unwrap();
+        let store = Store::<String>::open(&path, 0, Duration::ZERO).unwrap();
         store.put("k", &"old".into(), Duration::from_secs(600));
         store.put("k", &"new".into(), Duration::from_secs(600));
 
@@ -474,8 +511,40 @@ mod tests {
     #[test]
     fn a_missing_key_is_absent_not_an_error() {
         let path = temp_path();
-        let store = Store::<String>::open(&path, 0).unwrap();
+        let store = Store::<String>::open(&path, 0, Duration::ZERO).unwrap();
         assert!(store.get("never-written").is_none());
+    }
+
+    #[test]
+    fn an_expired_entry_is_stale_within_the_grace_period() {
+        let path = temp_path();
+        let store = Store::<String>::open(&path, 0, Duration::from_secs(600)).unwrap();
+        store.put("k", &"x".into(), Duration::from_secs(0));
+        drop(store);
+        let store = Store::<String>::open(&path, 0, Duration::from_secs(600)).unwrap();
+
+        assert!(store.get("k").is_none(), "a stale entry was read as fresh");
+        match store.lookup("k") {
+            Some(Found::Stale(v, left)) => {
+                assert_eq!(v, "x");
+                assert!(left <= Duration::from_secs(600));
+            }
+            _ => panic!("an entry inside its grace period was not found as stale"),
+        }
+    }
+
+    #[test]
+    fn sweeping_keeps_entries_inside_their_grace_period() {
+        // The sweep is what would otherwise take a stale answer away before a
+        // refetch has replaced it.
+        let path = temp_path();
+        let store = Store::<String>::open(&path, 0, Duration::from_secs(600)).unwrap();
+        store.put("k", &"x".into(), Duration::from_secs(0));
+        store.sweep();
+        drop(store);
+        let store = Store::<String>::open(&path, 0, Duration::from_secs(600)).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(matches!(store.lookup("k"), Some(Found::Stale(..))));
     }
 
     #[test]
@@ -483,7 +552,7 @@ mod tests {
         // Nothing bounds the disk tier on the write path, so without this the
         // table grows for as long as a caller keeps naming new coordinates.
         let path = temp_path();
-        let store = Store::<String>::open(&path, 10).unwrap();
+        let store = Store::<String>::open(&path, 10, Duration::ZERO).unwrap();
         for i in 0..100 {
             // Ascending TTLs, so the soonest-to-expire are the low indices.
             store.put(
@@ -504,7 +573,7 @@ mod tests {
     #[test]
     fn a_zero_cap_means_unbounded() {
         let path = temp_path();
-        let store = Store::<String>::open(&path, 0).unwrap();
+        let store = Store::<String>::open(&path, 0, Duration::ZERO).unwrap();
         for i in 0..50 {
             store.put(&format!("k{i}"), &"v".into(), Duration::from_secs(600));
         }
@@ -520,7 +589,7 @@ mod tests {
         // the transaction commits, so a stop that does not drain the queue
         // silently drops whatever was in it.
         let path = temp_path();
-        let store = Store::<String>::open(&path, 0).unwrap();
+        let store = Store::<String>::open(&path, 0, Duration::ZERO).unwrap();
         for i in 0..1000 {
             store.put(&format!("k{i}"), &format!("v{i}"), Duration::from_secs(600));
         }
